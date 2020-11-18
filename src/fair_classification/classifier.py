@@ -8,44 +8,72 @@
 # (c) 2020 Feedzai, Strictly Confidential
 from typing import Any, Dict, Iterable
 
-import enum
+from abc import ABC, abstractmethod
 import cvxpy as cvx
 import dccp
 import random
-import sys
 import numpy as np
 
 
-# TODO
-# - Create general class which abstracts Convex-Concave problems?
+class LinearClassifier(ABC):
+    def __init__(self, n_features, init, reg_term=0):
+        self.n_weights = n_features + 1
+        self.weights_ = cvx.Variable(n_features + 1)
+        self.weights_.value = np.hstack(([1], init))
+        self.regularization = reg_term
 
-class CovarianceThreshold:
-    """# note thresh for constraints will be cov_thresh[1] - cov_thresh[0]
-# had trouble satisfying exact 0s here in synthetic data tests, so go with small epsilon,
-# 1e-6...
-sensitive_attrs_to_cov_thresh =
-{"race_nonwhite": {0:{0:0, 1:1e-6}, 1:{0:0, 1:1e-6}, 2:{0:0, 1:1e-6}}}
-# zero covariance threshold, means try to get the fairest solution
-     x_control: dictionary of the type {"s": [...]}, key "s" is the sensitive
-      feature name, and the value is a 1-d list with n
-       elements holding the sensitive feature values
-    """
+    @property
+    def coeffs(self):
+        return self.weights_.value
 
-    def __init__(self):
-        self.attr_configs={}
-        self.attr_type={}
+    @staticmethod
+    def _add_intercept(X):
+        intercepts = np.ones((X.shape[0], 1))
+        return np.hstack((intercepts, X))
 
-    def set_attr(self, attr_name: str, attr_values: Iterable):
-        self.attr_configs[attr_name]=list(attr_values)
-        self.attr_type[attr_name]="categorical" if len(
-            attr_type) > 2 else "binary"
+    @abstractmethod
+    def _loss(self, X, y):
+        raise NotImplementedError("Subclasses must override this method")
+    
+    def loss(self, X, y):
+        X = LinearClassifier._add_intercept(X)
+        total_loss = 0
+        if 0 < self.regularization <= 1:
+            total_loss += cvx.sum_squares(self.weights_[1:]) * self.regularization
 
-    def set_threshold(self, constraint: Constraint, attr_name: str, **threshold_per_attr):
-        pass
+        total_loss += self._loss(X, y)
+        return total_loss
+        
+    def decision_boundary(self, X, y):
+        X = LinearClassifier._add_intercept(X)
+        return cvx.multiply(y, X * self.weights_)
+
+    def predict_proba(self, X):
+        X = LinearClassifier._add_intercept(X)
+        return X @ self.coeffs
 
 
-class FairConstraint:
-    """A linear constraint classifier.
+class LogisticRegression(LinearClassifier):
+    def _loss(self, X, y):
+        # logistic = log (1 + e^z)
+        logloss = cvx.logistic(cvx.multiply(-y, X * self.weights_))
+        return logloss
+    # obj += cvx.sum(  cvx.logistic( cvx.multiply(-y_k, X_k*w[k]) )  ) / num_all
+    # notice that we are dividing by the length of the whole dataset, and not
+    # just of this sensitive group. this way, the group that has more people
+    # contributes more to the loss
+
+
+class SVMLinear(LinearClassifier):
+    def _loss(self, X, y):
+        X = LinearClassifier._add_intercept(X)
+        svm = 1 - cvx.multiply(y,  X * self.weights_)
+        hinge_loss = cvx.maximum(0, svm)
+        return hinge_loss
+
+
+class ConstrainedClassifier:
+    """A constrained classifier.
 
     A fairness constrained classifier [1] is a  ...
     trains the model subject to various fairness constraints.
@@ -60,9 +88,10 @@ class FairConstraint:
         Maximum number of iterations taken for the ``DCCP`` solver
         to converge.
 
-    loss : str, default='logreg'
+    classifier : Classifier, default=LogisticRegression
         The loss function to optimize. Currently supported version
-        is 'logreg', which corresponds to the logistic loss problem.
+        is LogisticRegression, which corresponds to the
+        log loss.
 
     tol : float, default=1e-8
         The absolute accuracy of the solution. Corresponds to the
@@ -77,14 +106,14 @@ class FairConstraint:
     rand : pseudo-generator
         The pseudo-random number generator.
 
-    loss_fn: str
-        The name of the loss function.
+    classifier: estimator class
+        The classifier class.
 
     tolerance: float
         The absolute accuracy of the solution.
 
-    constraint_type: str with the constraint type
-        Name of the constraint type specified.
+    constraints_: the constraint
+        The ``DCCP`` constraints.
 
     constraints_configs: dict of constraint configs
         The constraint configurations.
@@ -100,11 +129,6 @@ class FairConstraint:
     dccp_max_iter: int
         The ``DCCP`` framework parameter to control the number
         of iterations to run.
-
-    covariance_thresholds: list of dict with covariance thresholds
-        The dict of features with covariance thresholds for each constraint
-        type. To define threshold for FPR constraint type specify
-        ``{"FPR": <threshold_value>}``.
 
     hotstart_unconstrained: boolean
         Whether to use the best solution in the corresponding
@@ -124,47 +148,54 @@ class FairConstraint:
 
     Examples
     --------
-    >>> 
+    >>>
     """
 
-    def __init__(self, constraints_configs: Dict[str, Any]={}, max_iter: int=100, loss: str='logreg', tol: float=1e-8, random_state=None):
-        self.rand=np.random.RandomState(
+    def __init__(
+        self,
+        constraints_configs: Dict[str, Any] = {},
+        max_iter: int = 100,
+        classifier = LogisticRegression,
+        tol: float = 1e-8,
+        random_state=None
+    ):
+        self.rand = np.random.RandomState(
             random_state) if random_state else np.random.RandomState()
 
-        self.loss_fn=loss
-        self.tolerance=tol
-        self.max_iter=max_iter
-        self.constraints_configs=constraints_configs
-        self.constraints_type=constraints_configs.get('type', 0)
+        self.tolerance = tol
+        self.max_iter = max_iter
+        self.constraints_configs = constraints_configs
+        self.constraints_type = constraints_configs.get('type', 0)
 
         # DCCP parameters
-        self.dccp_tau=constraints_configs.get('tau', 0)
-        self.dccp_mu=constraints_configs.get('mu', 0)
-        self.dccp_max_iter=constraints_configs.get('max_iter', 50)
+        self.dccp_tau = constraints_configs.get('tau', 0)
+        self.dccp_mu = constraints_configs.get('mu', 0)
+        self.dccp_max_iter = constraints_configs.get('max_iter', 50)
 
-        self.dccp_params={
-                "tau_max": 1e10,
-                "solver": cvx.ECOS,
-                "verbose": False,
-                "feastol": tol,
-                "abstol": tol,
-                "reltol": tol,
-                "feastol_inacc": tol,
-                "abstol_inacc": tol,
-                "reltol_inacc": tol,
+        self.dccp_params = {
+            "tau_max": 1e10,
+            "solver": cvx.ECOS,
+            "verbose": False,
+            "feastol": tol,
+            "abstol": tol,
+            "reltol": tol,
+            "feastol_inacc": tol,
+            "abstol_inacc": tol,
+            "reltol_inacc": tol,
         }
         self.dccp_params.update(constraints_configs.get("dccp_params", {}))
 
         # Constraint Optimization parameters
-        self.covariance_thresholds=constraints_configs.get(
-            'covariance_thresholds', True)
-        self.hotstart_unconstrained=constraints_configs.get(
+        self.hotstart_unconstrained = constraints_configs.get(
             'hotstart_unconstrained', True)
 
-        self.weights_=None
-        self.constraints_=None
+        self.estimator_cls = classifier
+        self.estimator_ = None
+        self.constraints_ = self._init_constraints( # TODO - Parse constraint configs
+            X, y, X_protected, self.covariance_thresholds,
+            self.constraints_type, self.weights)
 
-    def fit(self, X, y, X_protected: Dict[str, np.ndarray]=None, sample_weight=None):
+    def fit(self, X, y, X_protected: Dict[str, np.ndarray] = None, sample_weight=None):
         """Build a fair classifier with fairness constraints from the training set (X, y).
 
         Parameters
@@ -188,57 +219,39 @@ class FairConstraint:
         self : object
             Fitted estimator.
         """
-        # TODO --> Fit Intercept (add column w/ 1s)
-        n_samples, n_features=X.shape
-        self.weights_=cvx.Variable(n_features)
-        self.weights_.value=self.rand.random(n_features)
-
-        self.constraints_=self.init_constraints(
-            X, y, X_protected, self.covariance_thresholds, self.constraints_type, self.weights)
-
-        # TODO - Refactor this
-        if self.loss_fn == "logreg":
-            # constructing the logistic loss problem
-            # we are converting y to a diagonal matrix for consistent
-
-            def logistic_reg(X, y, w):
-                logistic=cvx.logistic(cvx.multiply(-y, X*self.weights_))
-                return cvx.sum(logistic) / n_samples
-        else:
-            raise NotImplementedError(
-                f"Unavailable loss function: {self.loss_fn}")
+        n_samples, n_features = X.shape
+        estimator = self.estimator_cls(n_features, self.rand.random(n_features))
 
         if self.hotstart_unconstrained:
-            p=cvx.Problem(cvx.Minimize(loss), [])
-            p.solve()  # the solution is the weights (which got updated)
+            logging.info("Bootstrapping constr. problem w/ unconstrained solution")
+            loss = estimator.loss(X, y)
+            unc_problem = cvx.Problem(cvx.Minimize(cvx.sum(loss) / n_samples), [])
+            unc_problem.solve()  # the solution is the weights (which got updated)
+            logging.info(f"Unconstrained solution: {estimator.coeffs}")
 
         # Constrained Problem
-        problem=cvx.Problem(cvx.Minimize(loss), self.constraints_)
-        print("Problem is DCP (disciplined convex program):", problem.is_dcp())
-        print("Problem is DCCP (disciplined convex-concave program):",
-              dccp.is_dccp(problem))
+        loss = estimator.loss(X, y)
+        problem = cvx.Problem(cvx.Minimize(cvx.sum(loss) / n_samples)), self.constraints_)
+        logging.debug(
+            f"Problem is DCP (disciplined convex program): {problem.is_dcp()}")
+        logging.debug(
+            f"Problem is DCCP (disciplined convex-concave program): {dccp.is_dccp(problem)}")
 
         problem.solve(
-            tau=self.dccp_tau,
-            mu=self.dccp_mu,
-            max_iters=self.max_iter,
-            max_iter=self.max_iter_dccp,
+            tau = self.dccp_tau,
+            mu = self.dccp_mu,
+            max_iters = self.max_iter,
+            max_iter = self.max_iter_dccp,
             **self.dccp_params,
         )
         assert(problem.status is None or problem.status ==
-                "Converged" or problem.status == "optimal")
-        print("Optimization done, problem status:", problem.status)
+               "Converged" or problem.status == "optimal")
+        logging.info(f"Optimization done, problem status: {problem.status}")
 
-        # check that the fairness constraint is satisfied
-        for constraint in self.constraints_:
-            # can comment this out if the solver fails too often,
-            # but make sure that the constraints are satisfied empirically.
-            # alternatively, consider increasing tau parameter
-            assert(constraint.value() == True)
-
+        self.estimator_ = estimator
         return self
 
-    def predict_proba(self, X, threshold=0):
+    def predict_proba(self, X):
         """Predict class labels for samples in X.
 
         Parameters
@@ -251,10 +264,4 @@ class FairConstraint:
         C : array, shape [n_samples]
             Predicted class label per sample.
         """
-        n_features=self.weights_.value.shape[1]
-        if X.shape[1] + 1 != n_features:
-            raise ValueError("X has %d features per sample; expecting %d"
-                             % (X.shape[1], n_features - 1))
-
-        scores=X @ np.array(self.weights_.value).flatten()
-        return scores
+        return self.estimator_.predict_proba(X).flatten()
